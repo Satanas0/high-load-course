@@ -13,6 +13,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
+import ru.quipy.metrics.MetricsService
 
 
 // Advice: always treat time as a Duration
@@ -21,6 +22,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val metricsService: MetricsService,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -28,6 +30,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+        private const val TASK_NAME = "paymentTask"
     }
 
     private val serviceName = properties.serviceName
@@ -77,6 +80,8 @@ class PaymentExternalSystemAdapterImpl(
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
             }
+
+            metricsService.incrementCompletedTask(TASK_NAME)
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
