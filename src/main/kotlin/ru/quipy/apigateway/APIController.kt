@@ -8,6 +8,10 @@ import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
 import ru.quipy.metrics.MetricsService
+import java.time.Duration
+import org.springframework.http.ResponseEntity
+import ru.quipy.common.utils.SlidingWindowRateLimiter
+import org.springframework.http.HttpStatus
 
 @RestController
 class APIController (
@@ -21,6 +25,8 @@ class APIController (
 
     @Autowired
     private lateinit var orderPayer: OrderPayer
+
+    private val paymentRateLimiter = SlidingWindowRateLimiter(11, Duration.ofSeconds(1))
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -58,17 +64,19 @@ class APIController (
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto =
-        metricsService.collectMetric(listOf("POST", "/orders/{orderId}/payment")) {
+        fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
+        if (!paymentRateLimiter.tick()) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .body(mapOf("error" to "Rate limit exceeded", "retryAfter" to "1s"))
+        }
+
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             it
         } ?: throw IllegalArgumentException("No such order $orderId")
-
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-
-        return@collectMetric PaymentSubmissionDto(createdAt, paymentId)
+        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 
     class PaymentSubmissionDto(
