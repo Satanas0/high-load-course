@@ -3,10 +3,14 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.HttpStatus
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
+import java.util.concurrent.TimeUnit
 import ru.quipy.metrics.MetricsService
 import java.time.Duration
 import org.springframework.http.ResponseEntity
@@ -25,6 +29,13 @@ class APIController (
 
     @Autowired
     private lateinit var orderPayer: OrderPayer
+
+    private val rateLimiter = TokenBucketRateLimiter(
+        rate = 15,
+        bucketMaxCapacity = 45,
+        window = 1,
+        timeUnit = TimeUnit.SECONDS
+    )
 
     private val paymentRateLimiter = SlidingWindowRateLimiter(11, Duration.ofSeconds(1))
 
@@ -64,17 +75,21 @@ class APIController (
     }
 
     @PostMapping("/orders/{orderId}/payment")
-        fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
-        if (!paymentRateLimiter.tick()) {
+    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<*> {
+        if (!rateLimiter.tick()) {
+            logger.debug("Rate limit exceeded for payment request")
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .body(mapOf("error" to "Rate limit exceeded", "retryAfter" to "1s"))
+                .header("Retry-After", "0.1")
+                .body(mapOf("error" to "Rate limit exceeded"))
         }
 
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             it
-        } ?: throw IllegalArgumentException("No such order $orderId")
+        } ?: return ResponseEntity.status(HttpStatus.NOT_FOUND)
+            .body(mapOf("error" to "No such order $orderId"))
+
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
