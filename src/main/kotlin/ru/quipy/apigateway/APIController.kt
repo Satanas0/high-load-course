@@ -9,9 +9,8 @@ import org.springframework.web.bind.annotation.*
 import ru.quipy.common.utils.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
-import java.time.Duration
+import java.time.Duration.ofSeconds
 import java.util.*
-import java.util.concurrent.TimeUnit
 
 @RestController
 class APIController {
@@ -25,21 +24,20 @@ class APIController {
     private lateinit var orderPayer: OrderPayer
 
     private val slidingWindow = SlidingWindowRateLimiter(
-        rate = 660,
-        window = Duration.ofSeconds(60)
+        rate = 11,
+        window = ofSeconds(1)
     )
     
-    private val tokenBucket = TokenBucketRateLimiter(
+    private val leakingBucket = LeakingBucketRateLimiter(
         rate = 11,
-        bucketMaxCapacity = 22,
-        window = 1,
-        timeUnit = TimeUnit.SECONDS
+        bucketSize = 150,
+        window = ofSeconds(1)
     )
     
     private val compositeRateLimiter = CompositeRateLimiter(
         rl1 = slidingWindow,
-        rl2 = tokenBucket,
-        mode = CompositeMode.OR
+        rl2 = leakingBucket,
+        mode = CompositeMode.AND
     )
 
     @PostMapping("/users")
@@ -82,7 +80,7 @@ class APIController {
         if (!compositeRateLimiter.tick()) {
             logger.debug("Rate limit exceeded for payment request")
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "0.5")
+                .header("Retry-After", "1")
                 .body(mapOf("error" to "Rate limit exceeded"))
         }
 
