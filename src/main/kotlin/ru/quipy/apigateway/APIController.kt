@@ -74,7 +74,7 @@ class APIController (
         if (!rateLimiter.tick()) {
             logger.debug("Rate limit exceeded for payment request")
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "0.1")
+                .header("Retry-After", "1")
                 .body(mapOf("error" to "Rate limit exceeded"))
         }
 
