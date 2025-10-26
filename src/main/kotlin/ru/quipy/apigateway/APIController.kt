@@ -30,7 +30,7 @@ class APIController {
     
     private val leakingBucket = LeakingBucketRateLimiter(
         rate = 11,
-        bucketSize = 150,
+        bucketSize = 295,
         window = ofSeconds(1)
     )
     
@@ -80,7 +80,7 @@ class APIController {
         if (!compositeRateLimiter.tick()) {
             logger.debug("Rate limit exceeded for payment request")
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "1")
+                .header("Retry-After", "3")
                 .body(mapOf("error" to "Rate limit exceeded"))
         }
 
