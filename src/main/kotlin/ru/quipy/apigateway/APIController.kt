@@ -6,10 +6,10 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
-import java.time.Duration
+import java.time.Duration.ofSeconds
 import java.util.*
 import java.util.concurrent.TimeUnit
 import ru.quipy.metrics.MetricsService
@@ -27,9 +27,21 @@ class APIController (
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private val rateLimiter = SlidingWindowRateLimiter(
-        rate = 11,
-        window = Duration.ofSeconds(1),
+    private val slidingWindow = SlidingWindowRateLimiter(
+        rate = 10,
+        window = ofSeconds(1)
+    )
+    
+    private val leakingBucket = LeakingBucketRateLimiter(
+        rate = 10,
+        bucketSize = 40,
+        window = ofSeconds(1)
+    )
+    
+    private val compositeRateLimiter = CompositeRateLimiter(
+        rl1 = slidingWindow,
+        rl2 = leakingBucket,
+        mode = CompositeMode.AND
     )
 
     private val paymentRateLimiter = SlidingWindowRateLimiter(11, Duration.ofSeconds(1))
@@ -71,10 +83,11 @@ class APIController (
 
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<*> {
-        if (!rateLimiter.tick()) {
+        if (!compositeRateLimiter.tick()) {
             logger.debug("Rate limit exceeded for payment request")
+
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "1")
+                .header("Retry-After", "0")
                 .body(mapOf("error" to "Rate limit exceeded"))
         }
 
