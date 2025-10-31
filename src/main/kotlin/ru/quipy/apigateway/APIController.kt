@@ -9,6 +9,8 @@ import org.springframework.web.bind.annotation.*
 import ru.quipy.common.utils.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import ru.quipy.payments.logic.PaymentExternalSystemAdapter
+import ru.quipy.payments.logic.PaymentExternalSystemAdapterImpl
 import java.time.Duration.ofMillis
 import java.time.Duration.ofSeconds
 import java.util.*
@@ -17,9 +19,12 @@ import java.util.concurrent.TimeUnit
 import ru.quipy.metrics.MetricsService
 
 @RestController
-class APIController (
+class APIController(
     val metricsService: MetricsService,
+    adapters: List<PaymentExternalSystemAdapter>
 ) {
+    private val defaultAdapter = adapters.first() as? PaymentExternalSystemAdapterImpl
+    private val properties = defaultAdapter!!.properties
 
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
 
@@ -96,7 +101,7 @@ class APIController (
         if (now - lastTime > retryWindowMs) {
             retryCounters[orderId] = (1 to now)
         } else if (count >= maxRetries) {
-            logger.debug("Too many retries for order $orderId")
+            logger.debug("Too many retries for order {}", orderId)
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                 .body(mapOf("error" to "Too many retries for order $orderId"))
         } else {
@@ -104,15 +109,15 @@ class APIController (
         }
 
         val remaining = deadline - now
-        val avgProcessingMs = 700L
+        val avgProcessingMs = properties.averageProcessingTime.toMillis()
         if (remaining < avgProcessingMs) {
-            logger.debug("Deadline too close, skipping payment for order $orderId (remaining=$remaining ms)")
+            logger.debug("Deadline too close, skipping payment for order {} (remaining={} ms)", orderId, remaining)
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(mapOf("error" to "Deadline too close — payment no longer meaningful"))
         }
 
         if (!compositeRateLimiter.tick()) {
-            logger.debug("Rate limit exceeded for payment request of $orderId")
+            logger.debug("Rate limit exceeded for payment request of {}", orderId)
 
             val retryAfterMs = 500L
             return if (remaining > avgProcessingMs + retryAfterMs) {
