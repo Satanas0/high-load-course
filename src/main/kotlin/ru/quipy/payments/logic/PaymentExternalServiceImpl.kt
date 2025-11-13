@@ -10,6 +10,7 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
+import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
@@ -42,12 +43,17 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofMillis(1000));
     private val semaphore = Semaphore(parallelRequests)
-
-    private val client = OkHttpClient.Builder().build()
+    private val timeout = Duration.ofMillis(1010)
+    private val client = OkHttpClient.Builder()
+        .callTimeout(timeout)
+        .connectTimeout(timeout)
+        .readTimeout(timeout)
+        .writeTimeout(timeout)
+        .build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
-        val start = now()
+        val start = System.currentTimeMillis()
         val avgMs = requestAverageProcessingTime.toMillis()
         val remaining = deadline - start
         val maxRetries = 5
@@ -74,6 +80,11 @@ class PaymentExternalSystemAdapterImpl(
 
         while (attempt < maxRetries && !success) {
             attempt++
+
+            if (attempt > 1) {
+                metricsService.increaseRetryCounter()
+            }
+
             val attemptStart = now()
             val timeLeft = deadline - attemptStart
 
@@ -114,6 +125,10 @@ class PaymentExternalSystemAdapterImpl(
                     }
 
                     logger.info("CODE: ${response.code}")
+
+
+                    val duration = System.currentTimeMillis() - attemptStart
+                    metricsService.recordRequestDuration(duration, body.result)
 
                     if (response.isSuccessful && body.result) {
                         logger.info("[$accountName] Payment success for txId=$transactionId, payment=$paymentId")

@@ -9,6 +9,8 @@ class MetricsConfig(
     var incomingRequests: MetricProperties = MetricProperties(),
     var outgoingResponses: MetricProperties = MetricProperties(),
     var completedTasks: MetricProperties = MetricProperties(),
+    var requestDuration: MetricProperties = MetricProperties(),
+    var retryRequests: MetricProperties = MetricProperties(),
 ) {
     data class MetricProperties(
         var name: String = "default",

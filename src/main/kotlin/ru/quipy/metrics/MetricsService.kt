@@ -4,7 +4,9 @@ import org.springframework.stereotype.Service
 import ru.quipy.config.MetricsConfig
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Timer
 import io.micrometer.core.instrument.Tag
+import java.util.concurrent.TimeUnit
 
 @Service
 class MetricsService(
@@ -19,6 +21,24 @@ class MetricsService(
 
     fun incrementCompletedTask(method: String) {
         writeCounter(metricsConfig.completedTasks, listOf(method)).increment()
+    }
+
+    fun increaseRetryCounter() {
+        Counter
+            .builder(metricsConfig.retryRequests.name)
+            .description(metricsConfig.retryRequests.description)
+            .register(Metrics.globalRegistry).increment()
+    }
+
+
+    fun recordRequestDuration(durationMs: Long, success: Boolean) {
+        Timer.builder(metricsConfig.requestDuration.name)
+            .description(metricsConfig.requestDuration.description)
+            .tags("success", success.toString())
+            .publishPercentiles(0.5, 0.9, 0.95, 0.99)
+            .publishPercentileHistogram()
+            .register(Metrics.globalRegistry)
+            .record(durationMs, TimeUnit.MILLISECONDS)
     }
 
     private fun writeCounter(config: MetricsConfig.MetricProperties, tags: List<String>): Counter {
