@@ -43,7 +43,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofMillis(1000));
     private val semaphore = Semaphore(parallelRequests)
-    private val timeout = Duration.ofMillis(1010)
+    private val timeout = Duration.ofMillis(1090)
     private val client = OkHttpClient.Builder()
         .callTimeout(timeout)
         .connectTimeout(timeout)
