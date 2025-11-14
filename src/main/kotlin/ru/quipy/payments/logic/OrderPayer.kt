@@ -14,7 +14,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 @Service
-class OrderPayer {
+class OrderPayer (adapters: List<PaymentExternalSystemAdapter>) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
@@ -26,9 +26,14 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    private val defaultAdapter = adapters.first() as? PaymentExternalSystemAdapterImpl
+    private val properties = defaultAdapter!!.properties
+
+    val maxThreads = properties.parallelRequests
+
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        maxThreads,
+        maxThreads,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(8_000),
