@@ -3,9 +3,11 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.web.reactive.function.client.WebClient
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
@@ -36,7 +38,11 @@ class PaymentAccountsConfig {
     lateinit var allowedAccounts: List<String>
 
     @Bean
-    fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
+    fun accountAdapters(
+        paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
+        meterRegistry: MeterRegistry,
+        webClient: WebClient
+    ): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
             .GET()
@@ -57,7 +63,9 @@ class PaymentAccountsConfig {
                     it,
                     paymentService,
                     paymentProviderHostPort,
-                    token
+                    token,
+                    meterRegistry,
+                    webClient
                 )
             }
     }
