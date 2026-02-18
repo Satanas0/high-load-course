@@ -19,7 +19,7 @@ class OrderPayer(registry: MeterRegistry) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val THREAD_COUNT = 200
+        private const val THREAD_COUNT = 1000
     }
 
     @Autowired

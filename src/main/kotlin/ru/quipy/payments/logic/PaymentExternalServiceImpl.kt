@@ -1,15 +1,8 @@
 package ru.quipy.payments.logic
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.slf4j.Logger
-import io.micrometer.core.instrument.MeterRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
 import kotlinx.coroutines.reactor.awaitSingle
@@ -20,15 +13,13 @@ import org.slf4j.LoggerFactory
 import org.springframework.http.MediaType
 import org.springframework.web.reactive.function.client.WebClient
 import ru.quipy.common.utils.SlidingWindowRateLimiter
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.payments.logic.PaymentAggregateState
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.UUID
-import java.util.*
-import java.util.concurrent.Semaphore
 
 
 // Advice: always treat time as a Duration
@@ -42,9 +33,7 @@ class PaymentExternalSystemAdapterImpl(
 ) : PaymentExternalSystemAdapter {
 
     companion object {
-        val emptyBody = ByteArray(0).toRequestBody(null)
         val logger: Logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-        val mapper = ObjectMapper().registerKotlinModule()
         private const val TASK_NAME = "paymentTask"
     }
 
@@ -53,21 +42,13 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val semaphore = Semaphore(properties.parallelRequests)
 
-    private val timeout = Duration.ofMillis(1090)
-    private val client = OkHttpClient.Builder()
-        .callTimeout(timeout)
-        .connectTimeout(timeout)
-        .readTimeout(timeout)
-        .writeTimeout(timeout)
-        .build()
-
     @OptIn(DelicateCoroutinesApi::class)
-    private val dbScope = CoroutineScope(newFixedThreadPoolContext(100, "db_pool"))
+    private val dbScope = CoroutineScope(newFixedThreadPoolContext(500, "db_pool"))
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
-        val start = System.currentTimeMillis()
-        val avgMs = requestAverageProcessingTime.toMillis()
+        val start = now()
+        val avgMs = properties.averageProcessingTime.toMillis()
         val remaining = deadline - start
         val maxRetries = 5
         val timeout = 500L
@@ -76,11 +57,8 @@ class PaymentExternalSystemAdapterImpl(
 
         dbScope.launch {
             paymentESService.update(paymentId) {
-                it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(start - paymentStartedAt))
             }
-        // Always record submission
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(start - paymentStartedAt))
         }
 
         if (remaining < avgMs) {
@@ -110,103 +88,60 @@ class PaymentExternalSystemAdapterImpl(
                 break
             }
 
-            semaphore.acquire()
-            if (!rateLimiter.tick()) {
-                val retryDelay = timeout * attempt
-                logger.warn("[$accountName] Rate limited (attempt $attempt) delaying $retryDelay ms")
-                semaphore.release()
-                Thread.sleep(retryDelay)
-                continue
-            }
-
-        try {
-            val response = semaphore.withPermit {
-                rateLimiter.tickBlocking()
-                webClient
-                    .post()
-                    .uri(
-                        "http://$paymentProviderHostPort/external/process" +
-                            "?serviceName=$serviceName" +
-                            "&token=$token" +
-                            "&accountName=$accountName" +
-                            "&transactionId=$transactionId" +
-                            "&paymentId=$paymentId" +
-                            "&amount=$amount"
-                    )
-                    .accept(MediaType.APPLICATION_JSON)
-                    .retrieve()
-                    .toEntity(ExternalSysResponse::class.java)
-                    .awaitSingle()
-            }
             try {
-                val request = Request.Builder()
-                    .url(
-                        "http://$paymentProviderHostPort/external/process" +
+                val response = semaphore.withPermit {
+                    if (!rateLimiter.tick()) {
+                        while (!rateLimiter.tick()) {
+                            delay(10)
+                        }
+                    }
+                    
+                    webClient
+                        .post()
+                        .uri(
+                            "http://$paymentProviderHostPort/external/process" +
                                 "?serviceName=$serviceName" +
                                 "&token=$token" +
                                 "&accountName=$accountName" +
                                 "&transactionId=$transactionId" +
                                 "&paymentId=$paymentId" +
                                 "&amount=$amount"
-                    )
-                    .post(emptyBody)
-                    .build()
-
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] Failed to parse response: ${e.message}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
-
-            dbScope.launch {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(response.body!!.result, now(), transactionId, reason = response.body!!.message)
+                        )
+                        .accept(MediaType.APPLICATION_JSON)
+                        .retrieve()
+                        .toEntity(ExternalSysResponse::class.java)
+                        .awaitSingle()
                 }
-            }
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
+
+                val body = response.body
+                if (body == null) {
+                    lastReason = "Empty response body"
+                    logger.warn("[$accountName] Payment failed (attempt $attempt/$maxRetries): $lastReason")
+                    break
+                }
+
+                val duration = now() - attemptStart
+                metricsService.recordRequestDuration(duration, body.result)
+
+                if (response.statusCode.is2xxSuccessful && body.result) {
+                    logger.info("[$accountName] Payment success for txId=$transactionId, payment=$paymentId")
+                    success = true
                     dbScope.launch {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                        }
-                    }
-                }
-                else -> {
-                    dbScope.launch {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = e.message)
-                        }
-                    }
-                }
-            }
-        }
-    }
-                    logger.info("CODE: ${response.code}")
-
-
-                    val duration = System.currentTimeMillis() - attemptStart
-                    metricsService.recordRequestDuration(duration, body.result)
-
-                    if (response.isSuccessful && body.result) {
-                        logger.info("[$accountName] Payment success for txId=$transactionId, payment=$paymentId")
-                        success = true
                         paymentESService.update(paymentId) {
                             it.logProcessing(true, now(), transactionId, reason = body.message)
                         }
-                    } else {
-                        val retriable = isRetriable(null, response.code, body.message)
-                        lastReason = "HTTP ${response.code}: ${body.message}"
-                        logger.warn("[$accountName] Payment failed (attempt $attempt/$maxRetries): $lastReason, retriable=$retriable")
-
-                        if (!retriable) break
-
-                        val backoff = (timeout * attempt).coerceAtMost(timeLeft / 2)
-                        Thread.sleep(backoff)
                     }
+                } else {
+                    val retriable = isRetriable(null, response.statusCode.value(), body.message)
+                    lastReason = "HTTP ${response.statusCode.value()}: ${body.message}"
+                    logger.warn("[$accountName] Payment failed (attempt $attempt/$maxRetries): $lastReason, retriable=$retriable")
+
+                    if (!retriable) break
+
+                    val backoff = (timeout * attempt).coerceAtMost(timeLeft / 2)
+                    delay(backoff)
                 }
+                
                 metricsService.incrementCompletedTask(TASK_NAME)
             } catch (e: Exception) {
                 val retriable = isRetriable(e, null, e.message)
@@ -216,9 +151,9 @@ class PaymentExternalSystemAdapterImpl(
                 if (!retriable) break
 
                 val backoff = (timeout * attempt).coerceAtMost((deadline - now()) / 2)
-                Thread.sleep(backoff)
-            } finally {
-                semaphore.release()
+                if (backoff > 0) {
+                    delay(backoff)
+                }
             }
         }
 

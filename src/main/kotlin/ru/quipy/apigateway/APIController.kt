@@ -15,7 +15,6 @@ import java.time.Duration.ofMillis
 import java.time.Duration.ofSeconds
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 import ru.quipy.metrics.MetricsService
 import java.time.Duration
 
@@ -24,8 +23,9 @@ class APIController(
     val metricsService: MetricsService,
     adapters: List<PaymentExternalSystemAdapter>
 ) {
-    private val defaultAdapter = adapters.first() as? PaymentExternalSystemAdapterImpl
-    private val properties = defaultAdapter!!.properties
+    private val defaultAdapter = adapters.firstOrNull() as? PaymentExternalSystemAdapterImpl
+    private val properties = defaultAdapter?.properties 
+        ?: throw IllegalStateException("No PaymentExternalSystemAdapterImpl found in adapters list")
 
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
 
@@ -56,8 +56,6 @@ class APIController(
         rl2 = leakingBucket,
         mode = CompositeMode.AND
     )
-
-    private val paymentRateLimiter = SlidingWindowRateLimiter(11, Duration.ofSeconds(1))
 
     @PostMapping("/users")
     suspend fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -97,7 +95,7 @@ class APIController(
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    suspend payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<*> {
+    suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<*> {
         val now = System.currentTimeMillis()
 
         val (count, lastTime) = retryCounters[orderId] ?: (0 to now)
@@ -135,13 +133,14 @@ class APIController(
 
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS, attempt = it.attempt + 1))
-            it
+            val updatedOrder = it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS, attempt = it.attempt + 1)
+            orderRepository.save(updatedOrder)
+            updatedOrder
         } ?: return ResponseEntity.status(HttpStatus.NOT_FOUND)
             .body(mapOf("error" to "No such order $orderId"))
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        return PaymentSubmissionDto(createdAt, paymentId)
+        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 
 
