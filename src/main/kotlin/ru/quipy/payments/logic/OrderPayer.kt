@@ -3,6 +3,7 @@ package ru.quipy.payments.logic
 import io.micrometer.core.instrument.MeterRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
 import org.slf4j.Logger
@@ -20,6 +21,7 @@ class OrderPayer(registry: MeterRegistry) {
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
         private const val THREAD_COUNT = 1000
+        private const val DEADLINE_GUARD_MS = 500L
     }
 
     @Autowired
@@ -30,7 +32,7 @@ class OrderPayer(registry: MeterRegistry) {
 
     @OptIn(DelicateCoroutinesApi::class)
     private val executorScope = CoroutineScope(
-        newFixedThreadPoolContext(THREAD_COUNT, "io_pool")
+        SupervisorJob() + newFixedThreadPoolContext(THREAD_COUNT, "io_pool")
     )
 
     private val paymentExecutionTimer = registry.timer("payment_executor_task_duration")
@@ -39,18 +41,27 @@ class OrderPayer(registry: MeterRegistry) {
         val createdAt = System.currentTimeMillis()
 
         executorScope.launch {
-            val start = System.nanoTime()
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
+            val queuedAt = System.currentTimeMillis()
+            if (deadline - queuedAt < DEADLINE_GUARD_MS) {
+                logger.warn("Payment $paymentId deadline expired while queued (${deadline - queuedAt}ms remaining), skipping")
+                return@launch
             }
-            logger.info("Payment ${createdEvent.paymentId} for order $orderId created.")
+            val start = System.nanoTime()
+            try {
+                val createdEvent = paymentESService.create {
+                    it.create(
+                        paymentId,
+                        orderId,
+                        amount
+                    )
+                }
+                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-            paymentExecutionTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                paymentExecutionTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)
+            } catch (e: Exception) {
+                logger.error("Failed to process payment $paymentId for order $orderId", e)
+            }
         }
 
         return createdAt

@@ -1,8 +1,14 @@
 package ru.quipy.config
 
 import jakarta.annotation.PostConstruct
+import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
+import org.eclipse.jetty.server.ServerConnector
 import org.slf4j.LoggerFactory
+import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Value
+import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory
+import org.springframework.boot.web.server.WebServerFactoryCustomizer
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import ru.quipy.core.EventSourcingServiceFactory
@@ -48,6 +54,25 @@ class EventSourcingLibConfiguration {
      */
     @Bean
     fun paymentsEsService() = eventSourcingServiceFactory.create<UUID, PaymentAggregate, PaymentAggregateState>()
+
+    @Bean
+    fun jettyHttp2Customizer(
+        @Value("\${server.jetty.http2.max-concurrent-streams:10000}") maxStreams: Int
+    ): WebServerFactoryCustomizer<JettyServletWebServerFactory> {
+        return WebServerFactoryCustomizer { factory ->
+            factory.addServerCustomizers(JettyServerCustomizer { server ->
+                for (connector in server.connectors) {
+                    if (connector is ServerConnector) {
+                        for (cf in connector.connectionFactories) {
+                            if (cf is HTTP2CServerConnectionFactory) {
+                                cf.maxConcurrentStreams = maxStreams
+                            }
+                        }
+                    }
+                }
+            })
+        }
+    }
 
     @PostConstruct
     fun init() {

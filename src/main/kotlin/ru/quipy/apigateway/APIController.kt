@@ -3,6 +3,7 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
@@ -21,7 +22,8 @@ import java.time.Duration
 @RestController
 class APIController(
     val metricsService: MetricsService,
-    adapters: List<PaymentExternalSystemAdapter>
+    adapters: List<PaymentExternalSystemAdapter>,
+    @Value("\${payment.api.rate-limit-per-sec:4000}") apiRateLimitPerSec: Int
 ) {
     private val defaultAdapter = adapters.firstOrNull() as? PaymentExternalSystemAdapterImpl
     private val properties = defaultAdapter?.properties 
@@ -41,13 +43,13 @@ class APIController(
 
 
     private val slidingWindow = SlidingWindowRateLimiter(
-        rate = 10,
+        rate = apiRateLimitPerSec.toLong(),
         window = ofSeconds(1)
     )
 
     private val leakingBucket = LeakingBucketRateLimiter(
-        rate = 10,
-        bucketSize = 38,
+        rate = apiRateLimitPerSec.toLong(),
+        bucketSize = (apiRateLimitPerSec * 4).coerceAtLeast(100),
         window = ofMillis(1000)
     )
 

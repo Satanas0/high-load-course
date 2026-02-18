@@ -1,11 +1,14 @@
 package ru.quipy.payments.logic
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
-import kotlinx.coroutines.reactor.awaitSingle
+import kotlinx.coroutines.reactive.awaitSingle
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import org.slf4j.Logger
@@ -22,7 +25,6 @@ import java.time.Duration
 import java.util.UUID
 
 
-// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -42,29 +44,43 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val semaphore = Semaphore(properties.parallelRequests)
 
+    override fun hasCapacity(): Boolean =
+        rateLimiter.hasCapacity() && semaphore.availablePermits > 0
+
     @OptIn(DelicateCoroutinesApi::class)
-    private val dbScope = CoroutineScope(newFixedThreadPoolContext(500, "db_pool"))
+    private val dbScope = CoroutineScope(SupervisorJob() + newFixedThreadPoolContext(8, "es_write_pool"))
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
         val start = now()
         val avgMs = properties.averageProcessingTime.toMillis()
         val remaining = deadline - start
-        val maxRetries = 5
-        val timeout = 500L
+        val maxRetries = 3
+        val backoffBase = 10L
 
-        logger.info("[$accountName] Submitting payment $paymentId (txId=$transactionId), remaining=${remaining}ms")
+        logger.trace("[$accountName] Submitting payment $paymentId (txId=$transactionId), remaining=${remaining}ms")
 
-        dbScope.launch {
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(start - paymentStartedAt))
+        val submissionJob: Deferred<Unit> = dbScope.async {
+            try {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(start - paymentStartedAt))
+                }
+            } catch (e: Exception) {
+                logger.error("[$accountName] Failed to log submission for $paymentId", e)
             }
         }
 
-        if (remaining < avgMs) {
+        if (remaining < avgMs + 100) {
             logger.warn("[$accountName] Skipping payment $paymentId: remaining ${remaining}ms < avg ${avgMs}ms")
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline too close")
+            dbScope.launch {
+                submissionJob.join()
+                try {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline too close")
+                    }
+                } catch (e: Exception) {
+                    logger.error("[$accountName] Failed to log deadline skip for $paymentId", e)
+                }
             }
             return
         }
@@ -83,19 +99,38 @@ class PaymentExternalSystemAdapterImpl(
             val attemptStart = now()
             val timeLeft = deadline - attemptStart
 
-            if (timeLeft < avgMs) {
+            if (timeLeft < avgMs + 100) {
                 logger.warn("[$accountName] Stop retrying payment $paymentId: deadline too close (${timeLeft}ms left)")
                 break
             }
-
-            try {
-                val response = semaphore.withPermit {
-                    if (!rateLimiter.tick()) {
-                        while (!rateLimiter.tick()) {
-                            delay(10)
+            while (!rateLimiter.tick()) {
+                val remaining2 = deadline - now()
+                if (remaining2 < avgMs + 100) {
+                    logger.warn("[$accountName] Deadline expired while waiting for rate limiter for $paymentId (${remaining2}ms left)")
+                    dbScope.launch {
+                        submissionJob.join()
+                        try {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = "Deadline expired in rate limiter queue")
+                            }
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] Failed to log deadline expiry for $paymentId", e)
                         }
                     }
-                    
+                    return
+                }
+                delay(1)
+            }
+
+            try {
+                val preCallRemaining = deadline - now()
+                if (preCallRemaining <= avgMs) {
+                    lastReason = "Deadline passed before HTTP call"
+                    break
+                }
+                val httpTimeoutMs = preCallRemaining.coerceIn(200, 15_000)
+
+                val response = semaphore.withPermit {
                     webClient
                         .post()
                         .uri(
@@ -110,13 +145,14 @@ class PaymentExternalSystemAdapterImpl(
                         .accept(MediaType.APPLICATION_JSON)
                         .retrieve()
                         .toEntity(ExternalSysResponse::class.java)
+                        .timeout(Duration.ofMillis(httpTimeoutMs))
                         .awaitSingle()
                 }
 
                 val body = response.body
                 if (body == null) {
                     lastReason = "Empty response body"
-                    logger.warn("[$accountName] Payment failed (attempt $attempt/$maxRetries): $lastReason")
+                    logger.warn("[$accountName] Empty response for $paymentId (attempt $attempt)")
                     break
                 }
 
@@ -124,11 +160,17 @@ class PaymentExternalSystemAdapterImpl(
                 metricsService.recordRequestDuration(duration, body.result)
 
                 if (response.statusCode.is2xxSuccessful && body.result) {
-                    logger.info("[$accountName] Payment success for txId=$transactionId, payment=$paymentId")
+                    logger.trace("[$accountName] Payment success for txId=$transactionId, payment=$paymentId")
                     success = true
+                    val capturedMessage = body.message
                     dbScope.launch {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(true, now(), transactionId, reason = body.message)
+                        submissionJob.join()
+                        try {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(true, now(), transactionId, reason = capturedMessage)
+                            }
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] Failed to log processing success for $paymentId", e)
                         }
                     }
                 } else {
@@ -138,10 +180,10 @@ class PaymentExternalSystemAdapterImpl(
 
                     if (!retriable) break
 
-                    val backoff = (timeout * attempt).coerceAtMost(timeLeft / 2)
-                    delay(backoff)
+                    val backoff = (backoffBase * attempt).coerceAtMost(timeLeft / 2)
+                    if (backoff > 0) delay(backoff)
                 }
-                
+
                 metricsService.incrementCompletedTask(TASK_NAME)
             } catch (e: Exception) {
                 val retriable = isRetriable(e, null, e.message)
@@ -150,16 +192,21 @@ class PaymentExternalSystemAdapterImpl(
 
                 if (!retriable) break
 
-                val backoff = (timeout * attempt).coerceAtMost((deadline - now()) / 2)
-                if (backoff > 0) {
-                    delay(backoff)
-                }
+                val backoff = (backoffBase * attempt).coerceAtMost((deadline - now()).coerceAtLeast(0) / 2)
+                if (backoff > 0) delay(backoff)
             }
         }
 
         if (!success) {
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = lastReason ?: "Permanent failure")
+            dbScope.launch {
+                submissionJob.join()
+                try {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = lastReason ?: "Permanent failure")
+                    }
+                } catch (e: Exception) {
+                    logger.error("[$accountName] Failed to log processing failure for $paymentId", e)
+                }
             }
         }
     }
