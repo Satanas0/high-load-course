@@ -44,13 +44,13 @@ class APIController(
         rate = 10,
         window = ofSeconds(1)
     )
-    
+
     private val leakingBucket = LeakingBucketRateLimiter(
         rate = 10,
         bucketSize = 38,
         window = ofMillis(1000)
     )
-    
+
     private val compositeRateLimiter = CompositeRateLimiter(
         rl1 = slidingWindow,
         rl2 = leakingBucket,
@@ -60,7 +60,7 @@ class APIController(
     private val paymentRateLimiter = SlidingWindowRateLimiter(11, Duration.ofSeconds(1))
 
     @PostMapping("/users")
-    fun createUser(@RequestBody req: CreateUserRequest): User {
+    suspend fun createUser(@RequestBody req: CreateUserRequest): User {
         return User(UUID.randomUUID(), req.name)
     }
 
@@ -69,13 +69,14 @@ class APIController(
     data class User(val id: UUID, val name: String)
 
     @PostMapping("/orders")
-    fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
+    suspend fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
         val order = Order(
             UUID.randomUUID(),
             userId,
             System.currentTimeMillis(),
             OrderStatus.COLLECTING,
             price,
+            0
         )
         return orderRepository.save(order)
     }
@@ -86,6 +87,7 @@ class APIController(
         val timeCreated: Long,
         val status: OrderStatus,
         val price: Int,
+        val attempt: Int
     )
 
     enum class OrderStatus {
@@ -95,7 +97,7 @@ class APIController(
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<*> {
+    suspend payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<*> {
         val now = System.currentTimeMillis()
 
         val (count, lastTime) = retryCounters[orderId] ?: (0 to now)
@@ -133,13 +135,13 @@ class APIController(
 
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS, attempt = it.attempt + 1))
             it
         } ?: return ResponseEntity.status(HttpStatus.NOT_FOUND)
             .body(mapOf("error" to "No such order $orderId"))
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+        return PaymentSubmissionDto(createdAt, paymentId)
     }
 
 

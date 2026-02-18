@@ -1,23 +1,25 @@
 package ru.quipy.payments.logic
 
+import io.micrometer.core.instrument.MeterRegistry
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.newFixedThreadPoolContext
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
-import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 @Service
-class OrderPayer (adapters: List<PaymentExternalSystemAdapter>) {
+class OrderPayer(registry: MeterRegistry) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
+        private const val THREAD_COUNT = 200
     }
 
     @Autowired
@@ -26,24 +28,18 @@ class OrderPayer (adapters: List<PaymentExternalSystemAdapter>) {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val defaultAdapter = adapters.first() as? PaymentExternalSystemAdapterImpl
-    private val properties = defaultAdapter!!.properties
-
-    val maxThreads = properties.parallelRequests
-
-    private val paymentExecutor = ThreadPoolExecutor(
-        maxThreads,
-        maxThreads,
-        0L,
-        TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
-        NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
+    @OptIn(DelicateCoroutinesApi::class)
+    private val executorScope = CoroutineScope(
+        newFixedThreadPoolContext(THREAD_COUNT, "io_pool")
     )
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+    private val paymentExecutionTimer = registry.timer("payment_executor_task_duration")
+
+    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
+
+        executorScope.launch {
+            val start = System.nanoTime()
             val createdEvent = paymentESService.create {
                 it.create(
                     paymentId,
@@ -51,10 +47,12 @@ class OrderPayer (adapters: List<PaymentExternalSystemAdapter>) {
                     amount
                 )
             }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+            logger.info("Payment ${createdEvent.paymentId} for order $orderId created.")
 
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            paymentExecutionTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)
         }
+
         return createdAt
     }
 }

@@ -7,13 +7,26 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.Logger
+import io.micrometer.core.instrument.MeterRegistry
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.newFixedThreadPoolContext
+import kotlinx.coroutines.reactor.awaitSingle
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import org.springframework.http.MediaType
+import org.springframework.web.reactive.function.client.WebClient
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
+import java.util.UUID
 import java.util.*
 import java.util.concurrent.Semaphore
 
@@ -25,24 +38,21 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     private val metricsService: MetricsService,
+    private val webClient: WebClient
 ) : PaymentExternalSystemAdapter {
 
     companion object {
-        val logger: Logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
         val emptyBody = ByteArray(0).toRequestBody(null)
+        val logger: Logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper = ObjectMapper().registerKotlinModule()
         private const val TASK_NAME = "paymentTask"
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val rateLimitPerSec = properties.rateLimitPerSec
-    private val parallelRequests = properties.parallelRequests
+    private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val semaphore = Semaphore(properties.parallelRequests)
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofMillis(1000));
-    private val semaphore = Semaphore(parallelRequests)
     private val timeout = Duration.ofMillis(1090)
     private val client = OkHttpClient.Builder()
         .callTimeout(timeout)
@@ -51,7 +61,10 @@ class PaymentExternalSystemAdapterImpl(
         .writeTimeout(timeout)
         .build()
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    @OptIn(DelicateCoroutinesApi::class)
+    private val dbScope = CoroutineScope(newFixedThreadPoolContext(100, "db_pool"))
+
+    override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
         val start = System.currentTimeMillis()
         val avgMs = requestAverageProcessingTime.toMillis()
@@ -61,6 +74,10 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submitting payment $paymentId (txId=$transactionId), remaining=${remaining}ms")
 
+        dbScope.launch {
+            paymentESService.update(paymentId) {
+                it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
         // Always record submission
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(start - paymentStartedAt))
@@ -102,6 +119,25 @@ class PaymentExternalSystemAdapterImpl(
                 continue
             }
 
+        try {
+            val response = semaphore.withPermit {
+                rateLimiter.tickBlocking()
+                webClient
+                    .post()
+                    .uri(
+                        "http://$paymentProviderHostPort/external/process" +
+                            "?serviceName=$serviceName" +
+                            "&token=$token" +
+                            "&accountName=$accountName" +
+                            "&transactionId=$transactionId" +
+                            "&paymentId=$paymentId" +
+                            "&amount=$amount"
+                    )
+                    .accept(MediaType.APPLICATION_JSON)
+                    .retrieve()
+                    .toEntity(ExternalSysResponse::class.java)
+                    .awaitSingle()
+            }
             try {
                 val request = Request.Builder()
                     .url(
@@ -124,6 +160,30 @@ class PaymentExternalSystemAdapterImpl(
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
 
+            dbScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(response.body!!.result, now(), transactionId, reason = response.body!!.message)
+                }
+            }
+        } catch (e: Exception) {
+            when (e) {
+                is SocketTimeoutException -> {
+                    dbScope.launch {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                        }
+                    }
+                }
+                else -> {
+                    dbScope.launch {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = e.message)
+                        }
+                    }
+                }
+            }
+        }
+    }
                     logger.info("CODE: ${response.code}")
 
 
@@ -172,11 +232,8 @@ class PaymentExternalSystemAdapterImpl(
 
 
     override fun price() = properties.price
-
     override fun isEnabled() = properties.enabled
-
     override fun name() = properties.accountName
-
 }
 
 private fun isRetriable(e: Exception?, code: Int?, message: String?): Boolean {
