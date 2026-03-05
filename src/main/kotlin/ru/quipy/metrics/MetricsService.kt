@@ -41,6 +41,21 @@ class MetricsService(
             .record(durationMs, TimeUnit.MILLISECONDS)
     }
 
+    fun incrementCounter(name: String, description: String = "") {
+        Counter.builder(name)
+            .description(description)
+            .register(Metrics.globalRegistry)
+            .increment()
+    }
+
+    fun incrementCounterWithTag(name: String, tagKey: String, tagValue: String, description: String = "") {
+        Counter.builder(name)
+            .description(description)
+            .tag(tagKey, tagValue)
+            .register(Metrics.globalRegistry)
+            .increment()
+    }
+
     private fun writeCounter(config: MetricsConfig.MetricProperties, tags: List<String>): Counter {
         val counterTags: List<Tag> =
             config.tags.mapIndexed { index, element ->

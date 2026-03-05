@@ -4,12 +4,17 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicInteger
 
 class OngoingWindow(
-    maxWinSize: Int
+    maxWinSize: Int,
+    fair: Boolean = false
 ) {
-    private val window = Semaphore(maxWinSize)
+    private val window = Semaphore(maxWinSize, fair)
 
     fun acquire() {
         window.acquire()
+    }
+
+    fun tryAcquire(timeout: Long, unit: java.util.concurrent.TimeUnit): Boolean {
+        return window.tryAcquire(timeout, unit)
     }
 
     fun release() = window.release()

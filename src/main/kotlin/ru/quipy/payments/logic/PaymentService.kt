@@ -4,10 +4,8 @@ import java.time.Duration
 import java.util.*
 
 interface PaymentService {
-    /**
-     * Submit payment request to some external service.
-     */
-    fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun submitPaymentRequest(paymentId: UUID, amount: Int, orderId: UUID, paymentStartedAt: Long, deadline: Long)
+    fun getMaxRateLimit(): Int
 }
 
 /**
@@ -17,13 +15,14 @@ interface PaymentService {
 
  */
 interface PaymentExternalSystemAdapter {
-    fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun performPaymentAsync(paymentId: UUID, amount: Int, orderId: UUID, paymentStartedAt: Long, deadline: Long)
 
     fun name(): String
 
     fun price(): Int
 
     fun isEnabled(): Boolean
+    fun maxRateLimit(): Int
 }
 
 /**
