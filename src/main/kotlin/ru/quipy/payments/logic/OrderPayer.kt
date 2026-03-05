@@ -33,8 +33,8 @@ class OrderPayer(
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
     private val paymentExecutor: ThreadPoolExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        32,
+        32,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(8_000),
