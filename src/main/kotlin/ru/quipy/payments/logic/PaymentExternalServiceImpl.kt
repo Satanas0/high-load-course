@@ -50,8 +50,8 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(parallelRequests, false)
+    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec * 19L / 20), Duration.ofSeconds(1))
+    private val ongoingWindow = OngoingWindow(parallelRequests * 19 / 20, false)
     private val latencyProfile = RollingLatencyProfile(maxSize = 2048, fallbackMs = requestAverageProcessingTime.coerceAtLeast(20L))
 
     private val httpThreadPoolSize = maxOf(100, parallelRequests / 10)
