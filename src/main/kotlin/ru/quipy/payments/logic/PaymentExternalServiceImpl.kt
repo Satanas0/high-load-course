@@ -50,7 +50,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong() / 10, Duration.ofMillis(100))
     private val ongoingWindow = OngoingWindow(parallelRequests, false)
     private val latencyProfile = RollingLatencyProfile(maxSize = 2048, fallbackMs = requestAverageProcessingTime.coerceAtLeast(20L))
 
@@ -206,46 +206,38 @@ class PaymentExternalSystemAdapterImpl(
                 performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
             }
         }.exceptionally { ex ->
+            val willRetry = attempt + 1 < MAX_ATTEMPTS && now() + requestAverageProcessingTime <= deadline
             when (ex) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
                     metricsService.incrementCounter("payment_failed_external", "Failed external requests")
-                    val currentTime = now()
-                    dbScope.launch {
-                        while (true) {
-                            try {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, currentTime, transactionId, reason = "Request timeout.")
-                                }
-                                break
-                            } catch (_: IllegalArgumentException) {
-                                delay(10)
-                            }
-                        }
-                    }
                 }
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
                     metricsService.incrementCounter("payment_failed_external", "Failed external requests")
-                    val currentTime = now()
-                    dbScope.launch {
-                        while (true) {
-                            try {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, currentTime, transactionId, reason = ex.message)
-                                }
-                                break
-                            } catch (_: IllegalArgumentException) {
-                                delay(10)
+                }
+            }
+            ongoingWindow.release()
+
+            if (willRetry) {
+                metricsService.increaseRetryCounter()
+                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
+            } else {
+                val currentTime = now()
+                val reason = if (ex is SocketTimeoutException) "Request timeout." else ex.message
+                dbScope.launch {
+                    while (true) {
+                        try {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, currentTime, transactionId, reason = reason)
                             }
+                            break
+                        } catch (_: IllegalArgumentException) {
+                            delay(10)
                         }
                     }
                 }
             }
-            metricsService.increaseRetryCounter()
-            ongoingWindow.release()
-
-            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
             null
         }
     }

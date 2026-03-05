@@ -7,7 +7,6 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
-import ru.quipy.apigateway.exceptions.RateLimitException
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.metrics.MetricsService
 import ru.quipy.orders.repository.OrderRepository
@@ -32,7 +31,7 @@ class APIController(
     @PostConstruct
     fun init() {
         val limit = orderPayer.getMaxRateLimit()
-        this.rateLimiter = SlidingWindowRateLimiter((limit * 4L / 5), Duration.ofSeconds(1))
+        this.rateLimiter = SlidingWindowRateLimiter((limit * 4L / 5) / 10, Duration.ofMillis(100))
     }
 
     @PostMapping("/users")
