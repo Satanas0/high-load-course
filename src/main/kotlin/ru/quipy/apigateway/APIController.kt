@@ -8,7 +8,7 @@ import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.apigateway.exceptions.RateLimitException
-import ru.quipy.common.utils.LeakingBucketRateLimiter
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.metrics.MetricsService
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
@@ -27,12 +27,12 @@ class APIController(
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private lateinit var rateLimiter: LeakingBucketRateLimiter
+    private lateinit var rateLimiter: SlidingWindowRateLimiter
 
     @PostConstruct
     fun init() {
         val limit = orderPayer.getMaxRateLimit()
-        this.rateLimiter = LeakingBucketRateLimiter(limit.toLong(), Duration.ofSeconds(1), 400)
+        this.rateLimiter = SlidingWindowRateLimiter((limit * 4L / 5), Duration.ofSeconds(1))
     }
 
     @PostMapping("/users")
