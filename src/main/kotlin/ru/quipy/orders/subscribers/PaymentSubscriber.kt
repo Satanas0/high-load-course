@@ -34,14 +34,22 @@ class PaymentSubscriber {
             retryConf = RetryConf(1, RetryFailedStrategy.SKIP_EVENT)
         ) {
             `when`(PaymentProcessedEvent::class) { event ->
-                appExecutor.submit {
-                    logger.trace(
-                        "Payment results. OrderId ${event.orderId}, succeeded: ${event.success}, txId: ${event.transactionId}, reason: ${event.reason}, duration: ${
+                appExecutor.execute {
+                    try {
+                        logger.trace(
+                            "Payment results. OrderId {}, succeeded: {}, txId: {}, reason: {}, duration: {}, spent in queue: {}",
+                            event.orderId,
+                            event.success,
+                            event.transactionId,
+                            event.reason,
                             Duration.ofMillis(
                                 event.createdAt - event.submittedAt
-                            ).toSeconds()
-                        }, spent in queue: ${event.spentInQueueDuration.toSeconds()}"
-                    )
+                            ).toSeconds(),
+                            event.spentInQueueDuration.toSeconds()
+                        )
+                    } catch (e: Exception) {
+                        logger.error("Failed to handle PaymentProcessedEvent for orderId={}", event.orderId, e)
+                    }
                 }
             }
         }

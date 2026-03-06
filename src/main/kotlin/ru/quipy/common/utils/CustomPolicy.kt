@@ -21,7 +21,8 @@ class CallerBlockingRejectedExecutionHandler(
                 val queue = executor.queue
                 val offer = queue.offer(r, maxWait.toMillis(), TimeUnit.MILLISECONDS)
                 if (!offer) {
-                    throw RejectedExecutionException("Max wait time expired to queue task")
+                    logger.warn("Task rejected: queue overloaded (size={}, active={}, pool={})", queue.size, executor.activeCount, executor.poolSize)
+                    throw RejectedExecutionException("Queue overloaded: max wait ${maxWait.toMillis()}ms expired")
                 }
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()

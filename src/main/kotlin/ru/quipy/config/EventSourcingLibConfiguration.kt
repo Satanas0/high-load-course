@@ -1,18 +1,25 @@
 package ru.quipy.config
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import com.zaxxer.hikari.HikariDataSource
 import jakarta.annotation.PostConstruct
 import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.config.BeanPostProcessor
 import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer
 import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.stereotype.Component
 import ru.quipy.core.EventSourcingServiceFactory
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.PaymentAggregateState
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.streams.AggregateEventStreamManager
 import java.util.*
+import java.util.concurrent.Executors
 
 
 /**
@@ -52,6 +59,12 @@ class EventSourcingLibConfiguration {
     @Bean
     fun paymentsEsService() = eventSourcingServiceFactory.create<UUID, PaymentAggregate, PaymentAggregateState>()
 
+    @Bean
+    fun dbScope(): CoroutineScope {
+        val dbThreadPool = Executors.newFixedThreadPool(200, NamedThreadFactory("db-executor"))
+        return CoroutineScope(dbThreadPool.asCoroutineDispatcher())
+    }
+
     @PostConstruct
     fun init() {
         // Demonstrates how you can set up the listeners to the event stream
@@ -76,5 +89,20 @@ class EventSourcingLibConfiguration {
 
         jettyServletWebServerFactory.serverCustomizers.add(c)
         return jettyServletWebServerFactory
+    }
+}
+
+@Component
+class HikariDataSourceConfigurer : BeanPostProcessor {
+    private val logger = LoggerFactory.getLogger(HikariDataSourceConfigurer::class.java)
+
+    override fun postProcessAfterInitialization(bean: Any, beanName: String): Any {
+        if (bean is HikariDataSource) {
+            bean.maximumPoolSize = 400
+            bean.minimumIdle = 400
+            bean.connectionTimeout = 500
+            logger.info("HikariCP tuned: pool=${bean.maximumPoolSize}, connTimeout=${bean.connectionTimeout}ms, bean=$beanName")
+        }
+        return bean
     }
 }
