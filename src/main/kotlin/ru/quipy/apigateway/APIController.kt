@@ -84,9 +84,10 @@ class APIController(
 
         val query = Query.query(Criteria.where("_id").`is`(orderId).and("status").ne(OrderStatus.PAYMENT_IN_PROGRESS))
         val update = Update.update("status", OrderStatus.PAYMENT_IN_PROGRESS)
-        val result = mongoTemplate.updateFirst(query, update, Order::class.java)
+        val options = FindAndModifyOptions().returnNew(true)
+        val order = mongoTemplate.findAndModify(query, update, options, Order::class.java)
 
-        if (result.matchedCount == 0L) {
+        if (order == null) {
             throw IllegalArgumentException("No such order $orderId or payment already in progress")
         }
 
