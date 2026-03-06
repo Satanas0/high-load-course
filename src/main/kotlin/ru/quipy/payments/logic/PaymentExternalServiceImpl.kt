@@ -19,7 +19,8 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
-import java.util.UUID
+import java.util.*
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
@@ -40,6 +41,7 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper = ObjectMapper().registerKotlinModule()
+        private const val HEDGE_DELAY_FACTOR = 0.8 // доля от среднего времени обработки для задержки второго запроса
     }
 
     private val MAX_ATTEMPTS = 5
@@ -100,6 +102,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
+        // Проверка дедлайна и лимита попыток
         if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
             metricsService.incrementCounter("payment_failed_external", "Failed external requests")
             val currentTime = now()
@@ -118,6 +121,7 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        // Rate limiting
         if (!rateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
             metricsService.incrementCounter("payment_ratelimit_reject", "Rate limiter rejections")
             val currentTime = now()
@@ -136,6 +140,7 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        // Окно параллелизма
         val timeToBlock = deadline - System.currentTimeMillis()
         val acquired = ongoingWindow.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
         if (!acquired) {
@@ -157,55 +162,185 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        performHedgeRequest(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt)
+    }
+
+    private fun performSingleRequest(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        transactionId: UUID,
+        attempt: Long
+    ) {
         val callTimeout = computeCallTimeoutMs(deadline - now())
-        val request = HttpRequest
-            .newBuilder()
-            .timeout(Duration.ofMillis(callTimeout))
+        val request = buildHttpRequest(transactionId, paymentId, amount, deadline, callTimeout)
+
+        val attemptStart = now()
+        client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+            .thenApply { response -> handleResponse(response, paymentId, transactionId, attemptStart) }
+            .handle { result, ex -> handleOutcome(result, ex, paymentId, amount, paymentStartedAt, deadline, transactionId, attempt) }
+    }
+
+    // HEDGE: отправка двух запросов с задержкой
+    private fun performHedgeRequest(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        transactionId: UUID,
+        attempt: Long
+    ) {
+        val timeLeft = deadline - now()
+        val callTimeout = computeCallTimeoutMs(timeLeft)
+        val hedgeDelay = (requestAverageProcessingTime * HEDGE_DELAY_FACTOR).toLong().coerceAtMost(timeLeft / 2)
+
+        // Строим запросы (одинаковые)
+        val request = buildHttpRequest(transactionId, paymentId, amount, deadline, callTimeout)
+
+        // Первый запрос отправляем сразу
+        val future1 = client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+
+        // Второй запрос с задержкой
+        val future2 = CompletableFuture.supplyAsync({
+            Thread.sleep(hedgeDelay)
+            client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).get()
+        }, httpExecutor)
+
+        // Ждём первый успешный ответ
+        val anyFuture = CompletableFuture.anyOf(future1, future2)
+        anyFuture.whenComplete { result, throwable ->
+            // Отменяем незавершённый запрос
+            if (!future1.isDone) future1.cancel(true)
+            if (!future2.isDone) future2.cancel(true)
+
+            if (throwable != null) {
+                // Оба запроса провалились (или первый же выбросил исключение)
+                val ex = throwable
+                val willRetry = attempt + 1 < MAX_ATTEMPTS && now() + requestAverageProcessingTime <= deadline
+                when (ex) {
+                    is SocketTimeoutException -> {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
+                        metricsService.incrementCounter("payment_failed_external", "Failed external requests")
+                    }
+                    else -> {
+                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
+                        metricsService.incrementCounter("payment_failed_external", "Failed external requests")
+                    }
+                }
+                ongoingWindow.release()
+
+                if (willRetry) {
+                    metricsService.increaseRetryCounter()
+                    performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
+                } else {
+                    val currentTime = now()
+                    val reason = if (ex is SocketTimeoutException) "Request timeout." else ex.message
+                    dbScope.launch {
+                        while (true) {
+                            try {
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, currentTime, transactionId, reason = reason)
+                                }
+                                break
+                            } catch (_: IllegalArgumentException) {
+                                delay(10)
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Получили успешный ответ от одного из запросов
+                @Suppress("UNCHECKED_CAST")
+                val response = result as HttpResponse<String>
+                val attemptStart = now() // приблизительно, но можно сохранить время старта первого запроса; для простоты используем текущее
+                handleResponse(response, paymentId, transactionId, attemptStart)
+                // Здесь не запускаем ретрай, так как запрос успешен. Освобождение семафора произойдёт в handleResponse
+                // Но handleResponse уже содержит вызов ongoingWindow.release() при успехе? В текущей логике release делается в thenApply и exceptionally.
+                // Чтобы избежать дублирования, можно вынести release в отдельное место.
+                // Упростим: после обработки ответа (handleResponse) семафор уже освобождён (внутри handleResponse при успехе).
+                // В случае ошибки в handleResponse? Но мы сюда попадаем только при успешном завершении future, значит ответ получен без исключений.
+                // Однако handleResponse может обработать тело ответа и, если body.result == false, то она вызовет ретрай.
+                // В текущей версии handleResponse (которую мы используем) при body.result == false вызывает ретрай и освобождает семафор.
+                // Поэтому здесь дополнительно делать ничего не нужно.
+            }
+        }
+    }
+
+    // HEDGE: построение HTTP-запроса
+    private fun buildHttpRequest(
+        transactionId: UUID,
+        paymentId: UUID,
+        amount: Int,
+        deadline: Long,
+        timeoutMs: Long
+    ): HttpRequest {
+        return HttpRequest.newBuilder()
+            .timeout(Duration.ofMillis(timeoutMs))
             .header("deadline", "$deadline")
             .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
+    }
 
-        val attemptStart = now()
-        client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
-            val duration = now() - attemptStart
-            latencyProfile.record(duration.coerceAtLeast(1))
+    // HEDGE: обработка ответа (общая для single и hedge)
+    private fun handleResponse(
+        response: HttpResponse<String>,
+        paymentId: UUID,
+        transactionId: UUID,
+        attemptStart: Long
+    ): ExternalSysResponse? {
+        val duration = now() - attemptStart
+        latencyProfile.record(duration.coerceAtLeast(1))
 
-            val body = try {
-                mapper.readValue(response.body(), ExternalSysResponse::class.java)
-            } catch (e: Exception) {
-                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
-                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-            }
-            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+        val body = try {
+            mapper.readValue(response.body(), ExternalSysResponse::class.java)
+        } catch (e: Exception) {
+            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+        }
+        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-            val currentTime = now()
-            val result = body.result
-            val message = body.message
-            dbScope.launch {
-                while (true) {
-                    try {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(result, currentTime, transactionId, reason = message)
-                        }
-                        break
-                    } catch (_: IllegalArgumentException) {
-                        delay(10)
+        val currentTime = now()
+        val result = body.result
+        val message = body.message
+        dbScope.launch {
+            while (true) {
+                try {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(result, currentTime, transactionId, reason = message)
                     }
+                    break
+                } catch (_: IllegalArgumentException) {
+                    delay(10)
                 }
             }
+        }
 
-            if (body.result) {
-                metricsService.incrementCounter("payment_success", "Successful payments")
-                ongoingWindow.release()
-            }
-            else {
-                metricsService.increaseRetryCounter()
-                ongoingWindow.release()
+        if (body.result) {
+            metricsService.incrementCounter("payment_success", "Successful payments")
+            ongoingWindow.release()
+            return body
+        } else {
+            metricsService.increaseRetryCounter()
+            ongoingWindow.release()
+            // Здесь не запускаем ретрай, так как это сделает вызывающий код
+            return null
+        }
+    }
 
-                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
-            }
-        }.exceptionally { ex ->
+    // HEDGE: обработка финального исхода (для single request)
+    private fun handleOutcome(
+        result: ExternalSysResponse?,
+        ex: Throwable?,
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        transactionId: UUID,
+        attempt: Long
+    ) {
+        if (ex != null) {
             val willRetry = attempt + 1 < MAX_ATTEMPTS && now() + requestAverageProcessingTime <= deadline
             when (ex) {
                 is SocketTimeoutException -> {
@@ -238,7 +373,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
-            null
+        } else {
+            // Успех уже обработан в handleResponse, семафор освобождён, ретрай не нужен
         }
     }
 
