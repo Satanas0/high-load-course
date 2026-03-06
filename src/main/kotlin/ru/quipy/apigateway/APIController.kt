@@ -4,11 +4,6 @@ import jakarta.annotation.PostConstruct
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.data.mongodb.core.FindAndModifyOptions
-import org.springframework.data.mongodb.core.MongoTemplate
-import org.springframework.data.mongodb.core.query.Criteria
-import org.springframework.data.mongodb.core.query.Query
-import org.springframework.data.mongodb.core.query.Update
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
@@ -21,8 +16,7 @@ import java.util.*
 
 @RestController
 class APIController(
-    private val metricsService: MetricsService,
-    private val mongoTemplate: MongoTemplate 
+    private val metricsService: MetricsService
 ) {
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
 
@@ -83,16 +77,12 @@ class APIController(
                 .build()
         }
 
-        val query = Query.query(Criteria.where("_id").`is`(orderId).and("status").ne(OrderStatus.PAYMENT_IN_PROGRESS))
-        val update = Update.update("status", OrderStatus.PAYMENT_IN_PROGRESS)
-        val options = FindAndModifyOptions().returnNew(true)
-        val order = mongoTemplate.findAndModify(query, update, options, Order::class.java)
-
-        if (order == null) {
-            throw IllegalArgumentException("No such order $orderId or payment already in progress")
-        }
-
         val paymentId = UUID.randomUUID()
+        val order = orderRepository.findById(orderId)?.let {
+            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+            it
+        } ?: throw IllegalArgumentException("No such order $orderId")
+
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
