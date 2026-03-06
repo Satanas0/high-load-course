@@ -16,7 +16,7 @@ import java.util.*
 
 @RestController
 class APIController(
-    private val metricsService: MetricsService
+    private val metricsService: MetricsService,
     private val mongoTemplate: MongoTemplate 
 ) {
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
