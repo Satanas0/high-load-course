@@ -206,7 +206,7 @@ class PaymentExternalSystemAdapterImpl(
                 performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
             }
         }.exceptionally { ex ->
-            val willRetry = attempt + 1 < MAX_ATTEMPTS && now() + requestAverageProcessingTime <= deadline
+            val willRetry = attempt + 1 < MAX_ATTEMPTS
             when (ex) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
