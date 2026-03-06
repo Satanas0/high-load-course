@@ -17,6 +17,7 @@ import java.util.*
 @RestController
 class APIController(
     private val metricsService: MetricsService
+    private val mongoTemplate: MongoTemplate 
 ) {
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
 
@@ -77,12 +78,15 @@ class APIController(
                 .build()
         }
 
-        val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
+        val query = Query.query(Criteria.where("_id").`is`(orderId).and("status").ne(OrderStatus.PAYMENT_IN_PROGRESS))
+        val update = Update.update("status", OrderStatus.PAYMENT_IN_PROGRESS)
+        val result = mongoTemplate.updateFirst(query, update, Order::class.java)
 
+        if (result.matchedCount == 0L) {
+            throw IllegalArgumentException("No such order $orderId or payment already in progress")
+        }
+
+        val paymentId = UUID.randomUUID()
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
