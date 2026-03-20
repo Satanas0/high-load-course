@@ -162,9 +162,12 @@ class PaymentExternalSystemAdapterImpl(
         val callTimeout = computeCallTimeoutMs(deadline - now())
 
         // Try to acquire a second semaphore slot for a hedged parallel request.
-        val hedgedTransactionId = UUID.randomUUID()
-        val hedgeAcquired = ongoingWindow.tryAcquire(30, TimeUnit.MILLISECONDS)
-        val pendingFailures = AtomicInteger(if (hedgeAcquired) 2 else 1)
+        val hedge1TxId = UUID.randomUUID()
+        val hedge2TxId = UUID.randomUUID()
+        val hedge1Acquired = ongoingWindow.tryAcquire(30, TimeUnit.MILLISECONDS)
+        val hedge2Acquired = if (hedge1Acquired) ongoingWindow.tryAcquire(30, TimeUnit.MILLISECONDS) else false
+        val hedgeCount = 1 + (if (hedge1Acquired) 1 else 0) + (if (hedge2Acquired) 1 else 0)
+        val pendingFailures = AtomicInteger(hedgeCount)
         val won = AtomicBoolean(false)
 
         fun buildHttpRequest(txId: UUID): HttpRequest = HttpRequest
@@ -245,10 +248,14 @@ class PaymentExternalSystemAdapterImpl(
 
         client.sendAsync(buildHttpRequest(transactionId), HttpResponse.BodyHandlers.ofString())
             .whenComplete { response, ex -> onComplete(response, ex, transactionId) }
-
-        if (hedgeAcquired) {
-            client.sendAsync(buildHttpRequest(hedgedTransactionId), HttpResponse.BodyHandlers.ofString())
-                .whenComplete { response, ex -> onComplete(response, ex, hedgedTransactionId) }
+        
+        if (hedge1Acquired) {
+            client.sendAsync(buildHttpRequest(hedge1TxId), HttpResponse.BodyHandlers.ofString())
+                .whenComplete { response, ex -> onComplete(response, ex, hedge1TxId) }
+        }
+        if (hedge2Acquired) {
+            client.sendAsync(buildHttpRequest(hedge2TxId), HttpResponse.BodyHandlers.ofString())
+                .whenComplete { response, ex -> onComplete(response, ex, hedge2TxId) }
         }
     }
 
