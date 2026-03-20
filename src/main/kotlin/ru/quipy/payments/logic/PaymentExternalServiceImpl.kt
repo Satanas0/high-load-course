@@ -100,7 +100,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
-        if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
+        if (now() >= deadline || attempt >= MAX_ATTEMPTS) {
             metricsService.incrementCounter("payment_failed_external", "Failed external requests")
             val currentTime = now()
             dbScope.launch {
@@ -254,7 +254,7 @@ class PaymentExternalSystemAdapterImpl(
         val p95 = latencyProfile.quantile(0.95)
         val avg = requestAverageProcessingTime.coerceAtLeast(20L)
         val target = max(avg, p95)
-        val adaptive = target.coerceAtLeast(150L).coerceAtMost(800L)
+        val adaptive = target.coerceAtLeast(150L)
         val boundedByDeadline = (timeLeft - 50L).coerceAtLeast(500L)
         return adaptive.coerceAtMost(boundedByDeadline)
     }
