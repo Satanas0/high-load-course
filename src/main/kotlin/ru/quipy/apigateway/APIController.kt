@@ -31,7 +31,7 @@ class APIController(
     @PostConstruct
     fun init() {
         val limit = orderPayer.getMaxRateLimit()
-        this.rateLimiter = SlidingWindowRateLimiter((limit * 4L / 5) / 10, Duration.ofMillis(100))
+        this.rateLimiter = SlidingWindowRateLimiter(limit * 4L / 5, Duration.ofMillis(1000))
     }
 
     @PostMapping("/users")
