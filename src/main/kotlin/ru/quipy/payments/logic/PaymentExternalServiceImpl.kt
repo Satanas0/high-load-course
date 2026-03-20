@@ -26,6 +26,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
 class PaymentExternalSystemAdapterImpl(
@@ -157,79 +158,76 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        val attemptStart = now()
         val callTimeout = computeCallTimeoutMs(deadline - now())
-        val request = HttpRequest
+
+        // Try to acquire a second semaphore slot for a hedged parallel request.
+        val hedgedTransactionId = UUID.randomUUID()
+        val hedgeAcquired = ongoingWindow.tryAcquire(30, TimeUnit.MILLISECONDS)
+        val pendingFailures = AtomicInteger(if (hedgeAcquired) 2 else 1)
+        val won = AtomicBoolean(false)
+
+        fun buildHttpRequest(txId: UUID): HttpRequest = HttpRequest
             .newBuilder()
             .timeout(Duration.ofMillis(callTimeout))
             .header("deadline", "$deadline")
-            .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+            .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$txId&paymentId=$paymentId&amount=$amount"))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
-        val attemptStart = now()
-        client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
-            val duration = now() - attemptStart
-            latencyProfile.record(duration.coerceAtLeast(1))
+        fun onComplete(response: HttpResponse<String>?, ex: Throwable?, txId: UUID) {
+            if (ex != null) {
+                ongoingWindow.release()
+                val cause = (ex as? java.util.concurrent.CompletionException)?.cause ?: ex
+                logger.error("[$accountName] Payment exception for txId: $txId, payment: $paymentId", cause)
+                metricsService.incrementCounter("payment_failed_external", "Failed external requests")
 
-            val body = try {
-                mapper.readValue(response.body(), ExternalSysResponse::class.java)
-            } catch (e: Exception) {
-                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
-                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-            }
-            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-            val currentTime = now()
-            val result = body.result
-            val message = body.message
-            dbScope.launch {
-                while (true) {
-                    try {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(result, currentTime, transactionId, reason = message)
+                if (pendingFailures.decrementAndGet() == 0 && !won.get()) {
+                    val willRetry = attempt + 1 < MAX_ATTEMPTS && now() < deadline
+                    if (willRetry) {
+                        metricsService.increaseRetryCounter()
+                        performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
+                    } else {
+                        val currentTime = now()
+                        val reason = if (cause is SocketTimeoutException) "Request timeout." else cause.message
+                        dbScope.launch {
+                            while (true) {
+                                try {
+                                    paymentESService.update(paymentId) {
+                                        it.logProcessing(false, currentTime, transactionId, reason = reason)
+                                    }
+                                    break
+                                } catch (_: IllegalArgumentException) {
+                                    delay(10)
+                                }
+                            }
                         }
-                        break
-                    } catch (_: IllegalArgumentException) {
-                        delay(10)
                     }
                 }
+                return
             }
 
-            if (body.result) {
-                metricsService.incrementCounter("payment_success", "Successful payments")
-                ongoingWindow.release()
-            }
-            else {
-                metricsService.increaseRetryCounter()
-                ongoingWindow.release()
-
-                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
-            }
-        }.exceptionally { ex ->
-            val willRetry = attempt + 1 < MAX_ATTEMPTS && now() + requestAverageProcessingTime <= deadline
-            when (ex) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
-                    metricsService.incrementCounter("payment_failed_external", "Failed external requests")
-                }
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
-                    metricsService.incrementCounter("payment_failed_external", "Failed external requests")
-                }
-            }
+            val duration = now() - attemptStart
+            latencyProfile.record(duration.coerceAtLeast(1))
             ongoingWindow.release()
 
-            if (willRetry) {
-                metricsService.increaseRetryCounter()
-                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
-            } else {
+            val body = try {
+                mapper.readValue(response!!.body(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Payment parse error for txId: $txId, payment: $paymentId, code: ${response!!.statusCode()}")
+                ExternalSysResponse(txId.toString(), paymentId.toString(), false, e.message)
+            }
+            logger.warn("[$accountName] Payment for txId: $txId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+            if (body.result && won.compareAndSet(false, true)) {
+                // First success wins — write to ES exactly once.
+                metricsService.incrementCounter("payment_success", "Successful payments")
                 val currentTime = now()
-                val reason = if (ex is SocketTimeoutException) "Request timeout." else ex.message
                 dbScope.launch {
                     while (true) {
                         try {
                             paymentESService.update(paymentId) {
-                                it.logProcessing(false, currentTime, transactionId, reason = reason)
+                                it.logProcessing(true, currentTime, txId, reason = body.message)
                             }
                             break
                         } catch (_: IllegalArgumentException) {
@@ -237,8 +235,20 @@ class PaymentExternalSystemAdapterImpl(
                         }
                     }
                 }
+            } else if (!body.result && pendingFailures.decrementAndGet() == 0 && !won.get()) {
+                // All hedged requests returned failure — retry.
+                metricsService.increaseRetryCounter()
+                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
             }
-            null
+            // If body.result==true but won.compareAndSet failed: another request already won, ignore.
+        }
+
+        client.sendAsync(buildHttpRequest(transactionId), HttpResponse.BodyHandlers.ofString())
+            .whenComplete { response, ex -> onComplete(response, ex, transactionId) }
+
+        if (hedgeAcquired) {
+            client.sendAsync(buildHttpRequest(hedgedTransactionId), HttpResponse.BodyHandlers.ofString())
+                .whenComplete { response, ex -> onComplete(response, ex, hedgedTransactionId) }
         }
     }
 
