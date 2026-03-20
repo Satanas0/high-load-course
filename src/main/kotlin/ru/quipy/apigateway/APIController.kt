@@ -31,7 +31,7 @@ class APIController(
     @PostConstruct
     fun init() {
         val limit = orderPayer.getMaxRateLimit()
-        this.rateLimiter = SlidingWindowRateLimiter((limit * 4L / 5) / 10, Duration.ofMillis(100))
+        this.rateLimiter = SlidingWindowRateLimiter(limit * 4L / 5, Duration.ofMillis(1000))
     }
 
     @PostMapping("/users")
@@ -71,12 +71,6 @@ class APIController(
 
     @PostMapping("/orders/{orderId}/payment")
     suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
-        if (!rateLimiter.tick()) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", 1.toString())
-                .build()
-        }
-
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
