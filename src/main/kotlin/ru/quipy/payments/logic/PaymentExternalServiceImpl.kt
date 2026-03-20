@@ -164,9 +164,14 @@ class PaymentExternalSystemAdapterImpl(
         // Try to acquire a second semaphore slot for a hedged parallel request.
         val hedge1TxId = UUID.randomUUID()
         val hedge2TxId = UUID.randomUUID()
+        val hedge3TxId = UUID.randomUUID()
         val hedge1Acquired = ongoingWindow.tryAcquire(30, TimeUnit.MILLISECONDS)
         val hedge2Acquired = if (hedge1Acquired) ongoingWindow.tryAcquire(30, TimeUnit.MILLISECONDS) else false
-        val hedgeCount = 1 + (if (hedge1Acquired) 1 else 0) + (if (hedge2Acquired) 1 else 0)
+        val hedge3Acquired = if (hedge2Acquired) ongoingWindow.tryAcquire(30, TimeUnit.MILLISECONDS) else false
+        val hedgeCount = 1 +
+            (if (hedge1Acquired) 1 else 0) +
+            (if (hedge2Acquired) 1 else 0) +
+            (if (hedge3Acquired) 1 else 0)
         val pendingFailures = AtomicInteger(hedgeCount)
         val won = AtomicBoolean(false)
 
@@ -256,6 +261,10 @@ class PaymentExternalSystemAdapterImpl(
         if (hedge2Acquired) {
             client.sendAsync(buildHttpRequest(hedge2TxId), HttpResponse.BodyHandlers.ofString())
                 .whenComplete { response, ex -> onComplete(response, ex, hedge2TxId) }
+        }
+        if (hedge3Acquired) {
+            client.sendAsync(buildHttpRequest(hedge3TxId), HttpResponse.BodyHandlers.ofString())
+                .whenComplete { response, ex -> onComplete(response, ex, hedge3TxId) }
         }
     }
 
