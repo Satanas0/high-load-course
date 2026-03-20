@@ -71,12 +71,6 @@ class APIController(
 
     @PostMapping("/orders/{orderId}/payment")
     suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
-        if (!rateLimiter.tick()) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", 1.toString())
-                .build()
-        }
-
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
