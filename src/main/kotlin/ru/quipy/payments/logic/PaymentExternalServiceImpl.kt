@@ -249,7 +249,7 @@ class PaymentExternalSystemAdapterImpl(
                     } else {
                         logProcessingFailure(paymentId, transactionId, "Circuit breaker open")
                     }
-                    return@exceptionally null
+                    return@exceptionally Unit
                 }
 
                 val willRetry = attempt + 1 < MAX_ATTEMPTS && now() < deadline
@@ -271,7 +271,7 @@ class PaymentExternalSystemAdapterImpl(
                     val reason = if (root is SocketTimeoutException) "Request timeout." else root.message
                     logProcessingFailure(paymentId, transactionId, reason)
                 }
-                null
+                Unit
             }
     }
 
