@@ -160,7 +160,6 @@
                         </goals>
                         <configuration>
                             <sourceDirs>
-                                <source>src/main/kotlin</source>
                                 <source>target/generated-sources/annotations</source>
                             </sourceDirs>
                         </configuration>
