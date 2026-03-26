@@ -6,7 +6,6 @@ import io.github.resilience4j.circuitbreaker.CallNotPermittedException
 import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
-import io.github.resilience4j.core.functions.Schedulers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -75,8 +74,6 @@ class PaymentExternalSystemAdapterImpl(
     private val circuitBreakerScheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(2) { r ->
         Thread(r, "payment-cb-$accountName").apply { isDaemon = true }
     }
-
-    private val circuitBreakerSchedulerAdapter = Schedulers.fromScheduledExecutorService(circuitBreakerScheduler)
 
     private val circuitBreaker: CircuitBreaker = run {
         val config = CircuitBreakerConfig.custom()
@@ -197,10 +194,9 @@ class PaymentExternalSystemAdapterImpl(
             .build()
 
         val attemptStart = now()
-        CircuitBreaker.executeCompletionStage(
-            circuitBreakerSchedulerAdapter,
-            circuitBreaker
-        ) { client.sendAsync(request, HttpResponse.BodyHandlers.ofString()) }
+        circuitBreaker.executeCompletionStage<HttpResponse<String>> {
+            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        }
             .thenApply { response ->
                 val duration = now() - attemptStart
                 latencyProfile.record(duration.coerceAtLeast(1))
