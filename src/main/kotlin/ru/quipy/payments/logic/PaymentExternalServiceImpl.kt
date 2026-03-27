@@ -2,12 +2,15 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
-import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -20,13 +23,16 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
+import java.util.concurrent.CompletionException
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
+import kotlin.math.min
 
 class PaymentExternalSystemAdapterImpl(
     val properties: PaymentAccountProperties,
@@ -64,6 +70,26 @@ class PaymentExternalSystemAdapterImpl(
         Executors.defaultThreadFactory(),
         CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
     )
+
+    private val circuitBreakerScheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(2) { r ->
+        Thread(r, "payment-cb-$accountName").apply { isDaemon = true }
+    }
+
+    private val circuitBreaker: CircuitBreaker = run {
+        val config = CircuitBreakerConfig.custom()
+            .failureRateThreshold(55f)
+            .slowCallRateThreshold(50f)
+            .slowCallDurationThreshold(Duration.ofMillis(max(500L, requestAverageProcessingTime * 3 / 4)))
+            .waitDurationInOpenState(Duration.ofSeconds(10))
+            .permittedNumberOfCallsInHalfOpenState(20)
+            .minimumNumberOfCalls(30)
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+            .slidingWindowSize(50)
+            .automaticTransitionFromOpenToHalfOpenEnabled(true)
+            .recordExceptions(SocketTimeoutException::class.java, java.io.IOException::class.java)
+            .build()
+        CircuitBreakerRegistry.of(config).circuitBreaker("external-payment-$accountName")
+    }
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
@@ -167,69 +193,29 @@ class PaymentExternalSystemAdapterImpl(
             .build()
 
         val attemptStart = now()
-        client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
-            val duration = now() - attemptStart
-            latencyProfile.record(duration.coerceAtLeast(1))
+        circuitBreaker.executeCompletionStage<HttpResponse<String>> {
+            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        }
+            .thenApply { response ->
+                val duration = now() - attemptStart
+                latencyProfile.record(duration.coerceAtLeast(1))
 
-            val body = try {
-                mapper.readValue(response.body(), ExternalSysResponse::class.java)
-            } catch (e: Exception) {
-                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
-                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-            }
-            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-            val currentTime = now()
-            val result = body.result
-            val message = body.message
-            dbScope.launch {
-                while (true) {
-                    try {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(result, currentTime, transactionId, reason = message)
-                        }
-                        break
-                    } catch (_: IllegalArgumentException) {
-                        delay(10)
-                    }
+                val body = try {
+                    mapper.readValue(response.body(), ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                 }
-            }
+                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-            if (body.result) {
-                metricsService.incrementCounter("payment_success", "Successful payments")
-                ongoingWindow.release()
-            }
-            else {
-                metricsService.increaseRetryCounter()
-                ongoingWindow.release()
-
-                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
-            }
-        }.exceptionally { ex ->
-            val willRetry = attempt + 1 < MAX_ATTEMPTS && now() + requestAverageProcessingTime <= deadline
-            when (ex) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
-                    metricsService.incrementCounter("payment_failed_external", "Failed external requests")
-                }
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
-                    metricsService.incrementCounter("payment_failed_external", "Failed external requests")
-                }
-            }
-            ongoingWindow.release()
-
-            if (willRetry) {
-                metricsService.increaseRetryCounter()
-                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
-            } else {
                 val currentTime = now()
-                val reason = if (ex is SocketTimeoutException) "Request timeout." else ex.message
+                val result = body.result
+                val message = body.message
                 dbScope.launch {
                     while (true) {
                         try {
                             paymentESService.update(paymentId) {
-                                it.logProcessing(false, currentTime, transactionId, reason = reason)
+                                it.logProcessing(result, currentTime, transactionId, reason = message)
                             }
                             break
                         } catch (_: IllegalArgumentException) {
@@ -237,8 +223,89 @@ class PaymentExternalSystemAdapterImpl(
                         }
                     }
                 }
+
+                if (body.result) {
+                    metricsService.incrementCounter("payment_success", "Successful payments")
+                    ongoingWindow.release()
+                } else {
+                    metricsService.increaseRetryCounter()
+                    ongoingWindow.release()
+                    scheduleRetryWithBackoff(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt)
+                }
+            }.exceptionally { ex ->
+                val root = unwrapThrowable(ex)
+                ongoingWindow.release()
+
+                if (root is CallNotPermittedException) {
+                    logger.warn("[$accountName] Circuit breaker open, payment $paymentId — backing off")
+                    metricsService.incrementCounter("payment_circuit_open", "Circuit breaker open")
+                    if (attempt + 1 < MAX_ATTEMPTS && now() < deadline) {
+                        metricsService.increaseRetryCounter()
+                        val delayMs = min(5000L, 300L * (attempt + 1))
+                        circuitBreakerScheduler.schedule({
+                            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
+                        }, delayMs, TimeUnit.MILLISECONDS)
+                    } else {
+                        logProcessingFailure(paymentId, transactionId, "Circuit breaker open")
+                    }
+                    return@exceptionally Unit
+                }
+
+                val willRetry = attempt + 1 < MAX_ATTEMPTS && now() < deadline
+                when (root) {
+                    is SocketTimeoutException -> {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", root)
+                        metricsService.incrementCounter("payment_failed_external", "Failed external requests")
+                    }
+                    else -> {
+                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", root)
+                        metricsService.incrementCounter("payment_failed_external", "Failed external requests")
+                    }
+                }
+
+                if (willRetry) {
+                    metricsService.increaseRetryCounter()
+                    scheduleRetryWithBackoff(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt)
+                } else {
+                    val reason = if (root is SocketTimeoutException) "Request timeout." else root.message
+                    logProcessingFailure(paymentId, transactionId, reason)
+                }
+                Unit
             }
-            null
+    }
+
+    private fun scheduleRetryWithBackoff(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        transactionId: UUID,
+        attempt: Long,
+    ) {
+        val remaining = deadline - now()
+        if (remaining <= 0) {
+            logProcessingFailure(paymentId, transactionId, "Deadline exceeded before retry")
+            return
+        }
+        val backoff = min(2000L, 100L * (1 shl attempt.toInt().coerceAtMost(4)))
+        circuitBreakerScheduler.schedule({
+            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
+        }, min(backoff, remaining - 1).coerceAtLeast(0L), TimeUnit.MILLISECONDS)
+    }
+
+    private fun logProcessingFailure(paymentId: UUID, transactionId: UUID, reason: String?) {
+        val currentTime = now()
+        dbScope.launch {
+            while (true) {
+                try {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, currentTime, transactionId, reason = reason)
+                    }
+                    break
+                } catch (_: IllegalArgumentException) {
+                    delay(10)
+                }
+            }
         }
     }
 
@@ -254,9 +321,17 @@ class PaymentExternalSystemAdapterImpl(
         val p95 = latencyProfile.quantile(0.95)
         val avg = requestAverageProcessingTime.coerceAtLeast(20L)
         val target = max(avg, p95)
-        val adaptive = target.coerceAtLeast(150L).coerceAtMost(800L)
-        val boundedByDeadline = (timeLeft - 50L).coerceAtLeast(500L)
-        return adaptive.coerceAtMost(boundedByDeadline)
+        val adaptive = target.coerceAtLeast(150L)
+        val cap = (timeLeft - 50L).coerceAtLeast(150L)
+        return adaptive.coerceAtMost(cap)
+    }
+
+    private fun unwrapThrowable(t: Throwable): Throwable {
+        var c: Throwable = t
+        while (c is CompletionException && c.cause != null) {
+            c = c.cause!!
+        }
+        return c
     }
 }
 

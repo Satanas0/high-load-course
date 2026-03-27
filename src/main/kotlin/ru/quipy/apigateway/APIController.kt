@@ -1,17 +1,13 @@
 package ru.quipy.apigateway
 
-import jakarta.annotation.PostConstruct
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.metrics.MetricsService
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
-import java.time.Duration
 import java.util.*
 
 @RestController
@@ -25,14 +21,6 @@ class APIController(
 
     @Autowired
     private lateinit var orderPayer: OrderPayer
-
-    private lateinit var rateLimiter: SlidingWindowRateLimiter
-
-    @PostConstruct
-    fun init() {
-        val limit = orderPayer.getMaxRateLimit()
-        this.rateLimiter = SlidingWindowRateLimiter((limit * 4L / 5) / 10, Duration.ofMillis(100))
-    }
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -71,12 +59,6 @@ class APIController(
 
     @PostMapping("/orders/{orderId}/payment")
     suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
-        if (!rateLimiter.tick()) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", 1.toString())
-                .build()
-        }
-
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
