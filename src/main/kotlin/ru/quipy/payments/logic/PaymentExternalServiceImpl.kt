@@ -126,7 +126,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
-        if (now() >= deadline || attempt >= MAX_ATTEMPTS) {
+        if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
             metricsService.incrementCounter("payment_failed_external", "Failed external requests")
             val currentTime = now()
             dbScope.launch {
@@ -144,7 +144,7 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        if (!rateLimiter.tickBlocking(Duration.ofMillis(max(1L, deadline - now())))) {
+        if (!rateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
             metricsService.incrementCounter("payment_ratelimit_reject", "Rate limiter rejections")
             val currentTime = now()
             dbScope.launch {
