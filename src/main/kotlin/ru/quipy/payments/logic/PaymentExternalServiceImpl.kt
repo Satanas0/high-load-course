@@ -86,7 +86,6 @@ class PaymentExternalSystemAdapterImpl(
             .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
             .slidingWindowSize(50)
             .automaticTransitionFromOpenToHalfOpenEnabled(true)
-            // Если компилятор ругается на recordExceptions — удали эту строку целиком
             .recordExceptions(SocketTimeoutException::class.java, java.io.IOException::class.java)
             .build()
         CircuitBreakerRegistry.of(config).circuitBreaker("external-payment-$accountName")
